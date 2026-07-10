@@ -1,0 +1,52 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+    networks:
+      - dromind-network
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
+    environment:
+      - NODE_ENV=development
+    networks:
+      - dromind-network
+    restart: unless-stopped
+    depends_on:
+      - backend
+
+  mock-drone:
+    build:
+      context: ./backend # Reuses the backend environment containing OpenCV and Python dependencies
+      dockerfile: Dockerfile
+    volumes:
+      - ./mock_drone.py:/app/mock_drone.py
+      - ./drone.mp4:/app/drone.mp4
+    entrypoint: ["python", "/app/mock_drone.py", "--host", "backend", "--port", "8000","--video", "/app/drone.mp4"]
+    networks:
+      - dromind-network
+    depends_on:
+      - backend
+    restart: on-failure
+
+networks:
+  dromind-network:
+    driver: bridge
