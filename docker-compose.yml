@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   backend:
     build:
@@ -11,8 +9,12 @@ services:
       - ./backend:/app
     environment:
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://ollama:11434}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3.2}
     networks:
       - dromind-network
+    depends_on:
+      - ollama
     restart: unless-stopped
 
   frontend:
@@ -46,6 +48,30 @@ services:
     depends_on:
       - backend
     restart: on-failure
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    networks:
+      - dromind-network
+    restart: unless-stopped
+
+  ollama-pull-model:
+    image: curlimages/curl:latest
+    entrypoint: ["sh", "-c", "until curl -s http://ollama:11434/api/tags | grep -q \"$${OLLAMA_MODEL:-llama3.2}\"; do echo 'Pulling model $${OLLAMA_MODEL:-llama3.2}...'; curl -s -X POST http://ollama:11434/api/pull -d \"{\\\"name\\\": \\\"$${OLLAMA_MODEL:-llama3.2}\\\"}\"; sleep 5; done; echo 'Model pulled successfully!'"]
+    environment:
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3.2}
+    depends_on:
+      - ollama
+    networks:
+      - dromind-network
+    restart: on-failure
+
+volumes:
+  ollama-data:
 
 networks:
   dromind-network:

@@ -9,6 +9,7 @@ import io
 
 from langchain_core.messages import HumanMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_ollama import ChatOllama
 
 from app.agents.state import AgentState, Detection, IntrusionAlert, Telemetry
 
@@ -47,6 +48,32 @@ def decode_base64_image(b64_str: str) -> np.ndarray:
     img_data = base64.b64decode(b64_str)
     nparr = np.frombuffer(img_data, np.uint8)
     return cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+# LLM Factory supporting local Ollama & Gemini
+def get_llm():
+    ollama_url = os.getenv("OLLAMA_BASE_URL")
+    ollama_model = os.getenv("OLLAMA_MODEL", "llama3.2")
+    gemini_key = os.getenv("GEMINI_API_KEY")
+    
+    if ollama_url:
+        try:
+            return ChatOllama(
+                base_url=ollama_url,
+                model=ollama_model,
+            )
+        except Exception as e:
+            print(f"Failed to initialize ChatOllama: {e}")
+            
+    if gemini_key:
+        try:
+            return ChatGoogleGenerativeAI(
+                model="gemini-1.5-flash",
+                google_api_key=gemini_key
+            )
+        except Exception as e:
+            print(f"Failed to initialize ChatGoogleGenerativeAI: {e}")
+            
+    return None
 
 # ----------------- 1. DETECTION AGENT -----------------
 def detection_agent(state: AgentState) -> Dict[str, Any]:
@@ -94,7 +121,7 @@ def detection_agent(state: AgentState) -> Dict[str, Any]:
                 logs.append({
                     "agent": "DetectionAgent", 
                     "message": f"Object scan completed. Found {len(detections)} objects: " + 
-                               ", ".join([f"{d['label']} ({d['confidence']})" for d in detections])
+                                ", ".join([f"{d['label']} ({d['confidence']})" for d in detections])
                 })
         else:
             # Fallback mock detector (generates simulated detections that move slightly)
@@ -132,17 +159,11 @@ def geomorphology_agent(state: AgentState) -> Dict[str, Any]:
     logs = state.get("agent_logs", [])[:]
     logs.append({"agent": "GeomorphologyAgent", "message": "Analyzing terrain structure and elevation parameters..."})
     
-    gemini_key = os.getenv("GEMINI_API_KEY")
     telemetry = state.get("telemetry", {})
+    llm = get_llm()
     
-    if gemini_key:
+    if llm:
         try:
-            # Initialize Gemini VLM via LangChain
-            model = ChatGoogleGenerativeAI(
-                model="gemini-1.5-flash",
-                google_api_key=gemini_key
-            )
-            
             # Prepare image payload
             frame_b64 = state["frame_b64"]
             if "," in frame_b64:
@@ -155,23 +176,35 @@ def geomorphology_agent(state: AgentState) -> Dict[str, Any]:
                 f"Keep your analysis extremely concise (under 2 sentences) and focus on geomorphology."
             )
             
-            message = HumanMessage(
-                content=[
-                    {"type": "text", "text": prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": f"data:image/jpeg;base64,{frame_b64}"
-                    }
-                ]
-            )
+            # Attempt to use visual input if supported by model, otherwise fallback to text-only
+            is_multimodal = isinstance(llm, ChatGoogleGenerativeAI) or "vision" in getattr(llm, "model", "").lower() or "llava" in getattr(llm, "model", "").lower()
             
-            response = model.invoke([message])
+            try:
+                if is_multimodal:
+                    message = HumanMessage(
+                        content=[
+                            {"type": "text", "text": prompt},
+                            {
+                                "type": "image_url",
+                                "image_url": f"data:image/jpeg;base64,{frame_b64}"
+                            }
+                        ]
+                    )
+                    response = llm.invoke([message])
+                else:
+                    # Text only prompt fallback
+                    prompt_text = prompt + " (Analyze based on the telemetry and simulate/describe typical terrain at these coordinates)."
+                    response = llm.invoke([HumanMessage(content=prompt_text)])
+            except Exception as inner_e:
+                prompt_text = prompt + " (Analyze based on the telemetry and simulate/describe typical terrain at these coordinates)."
+                response = llm.invoke([HumanMessage(content=prompt_text)])
+                
             analysis = response.content.strip()
-            logs.append({"agent": "GeomorphologyAgent", "message": f"Gemini VLM Analysis: {analysis}"})
+            logs.append({"agent": "GeomorphologyAgent", "message": f"{llm.__class__.__name__} Analysis: {analysis}"})
             return {"geomorphology": analysis, "agent_logs": logs}
             
         except Exception as e:
-            logs.append({"agent": "GeomorphologyAgent", "message": f"Gemini API failed: {str(e)}. Falling back to simulation."})
+            logs.append({"agent": "GeomorphologyAgent", "message": f"LLM API failed: {str(e)}. Falling back to simulation."})
             
     # Mock Geomorphology based on coordinates & altitude
     lat = telemetry.get("latitude", 0.0)
@@ -193,18 +226,13 @@ def interpretation_agent(state: AgentState) -> Dict[str, Any]:
     logs = state.get("agent_logs", [])[:]
     logs.append({"agent": "InterpretationAgent", "message": "Evaluating operational impact and environment safety..."})
     
-    gemini_key = os.getenv("GEMINI_API_KEY")
     telemetry = state.get("telemetry", {})
     detections = state.get("detections", [])
     geomorphology = state.get("geomorphology", "")
+    llm = get_llm()
     
-    if gemini_key:
+    if llm:
         try:
-            model = ChatGoogleGenerativeAI(
-                model="gemini-1.5-flash",
-                google_api_key=gemini_key
-            )
-            
             prompt = (
                 f"You are the DroMIND Operational Interpretation Agent. "
                 f"Review the Drone Telemetry: Altitude={telemetry.get('altitude')}m, Speed={telemetry.get('speed')}m/s, Battery={telemetry.get('battery')}%. "
@@ -214,13 +242,13 @@ def interpretation_agent(state: AgentState) -> Dict[str, Any]:
                 f"Keep it under 2 sentences, action-oriented, and highly operational."
             )
             
-            response = model.invoke([prompt])
+            response = llm.invoke([prompt])
             op_info = response.content.strip()
-            logs.append({"agent": "InterpretationAgent", "message": f"Operational Insights: {op_info}"})
+            logs.append({"agent": "InterpretationAgent", "message": f"{llm.__class__.__name__} Insights: {op_info}"})
             return {"operational_interpretation": op_info, "agent_logs": logs}
             
         except Exception as e:
-            logs.append({"agent": "InterpretationAgent", "message": f"Gemini API failed: {str(e)}. Falling back to simulation."})
+            logs.append({"agent": "InterpretationAgent", "message": f"LLM API failed: {str(e)}. Falling back to simulation."})
             
     # Mock Operational Interpretation
     battery = telemetry.get("battery", 100)
